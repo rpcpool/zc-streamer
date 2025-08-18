@@ -3,7 +3,10 @@ use std::{
     io, mem,
     net::{SocketAddr, UdpSocket},
     os::fd::{AsFd, AsRawFd},
-    sync::{Arc, atomic::AtomicU64},
+    sync::{
+        Arc,
+        atomic::{AtomicI32, AtomicU64},
+    },
 };
 
 use core_affinity::CoreId;
@@ -212,19 +215,20 @@ struct IoUringEvLoop {
     send_req_rx: crossbeam_channel::Receiver<SendReqBatch>,
     registered_buffers_refcount_vec: Vec<RegisteredBufferRc>,
     linger: usize,
-    stats: Arc<SendStats>,
+    stats: Arc<GlobalSendStats>,
     disconnected: bool,
 }
 
 #[derive(Debug, Default)]
-struct SendStats {
-    bytes_sent: AtomicU64,
-    errono_count: AtomicU64,
-    zc_send_count: AtomicU64,
-    copied_send_count: AtomicU64,
-    submit_count: AtomicU64,
-    submit_wait_cumu_time_ms: AtomicU64,
-    inflight_send: AtomicU64,
+pub struct GlobalSendStats {
+    pub bytes_sent: AtomicU64,
+    pub errno_count: AtomicU64,
+    pub last_errno: AtomicI32,
+    pub zc_send_count: AtomicU64,
+    pub copied_send_count: AtomicU64,
+    pub submit_count: AtomicU64,
+    pub submit_wait_cumu_time_ms: AtomicU64,
+    pub inflight_send: AtomicU64,
 }
 
 impl IoUringEvLoop {
@@ -325,9 +329,16 @@ impl IoUringEvLoop {
                 rbuf: Some(rbuf2),
                 free_rbuf_tx: self.free_buffer_tx.clone(),
             };
-            self.free_buffer_tx
-                .try_send(new_permit)
-                .expect("release_used_buffer");
+            match self.free_buffer_tx.try_send(new_permit) {
+                Ok(_) => {}
+                Err(TrySendError::Disconnected(_)) => {
+                    self.disconnected = true;
+                    return;
+                }
+                Err(TrySendError::Full(_)) => {
+                    panic!("Free buffer channel should not be full");
+                }
+            }
         }
     }
 
@@ -399,12 +410,13 @@ impl IoUringEvLoop {
                     self.stats
                         .bytes_sent
                         .fetch_add(byte_sent as _, std::sync::atomic::Ordering::Relaxed);
-                    self.stats
-                        .zc_send_count
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some(e) = err {
+                        self.stats.last_errno.store(
+                            e.raw_os_error().unwrap_or(0),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         self.stats
-                            .errono_count
+                            .errno_count
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         log::error!("SendZc failed with -errno: {e:?}");
                     }
@@ -416,12 +428,15 @@ impl IoUringEvLoop {
                 } => {
                     let ctx = self.send_req_ctx_slab.remove(slab_key);
                     self.dec_used_buffer_ref_cnt(ctx.rbuf_index);
+                    self.stats
+                        .inflight_send
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     if zero_copy {
                         log::trace!("SendZc completed with zero-copy");
                         self.stats
                             .zc_send_count
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    } else {
+                    } else if err.is_none() {
                         log::debug!("sendzc failed to used zero-copy");
                         self.stats
                             .copied_send_count
@@ -431,7 +446,7 @@ impl IoUringEvLoop {
                     if let Some(e) = err {
                         log::error!("SendZc failed with -errno: {e:?}");
                         self.stats
-                            .errono_count
+                            .errno_count
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -513,11 +528,25 @@ impl IoUringEvLoop {
 }
 
 ///
-/// Zero-Copy Multicast Sender
+/// Zero-Copy Multicast Sender.
+///
+/// This struct is responsible for sending multicast messages using zero-copy techniques.
+/// It uses io-uring SendZc with registered buffers for optimal efficiency.
+///
+/// In case your NIC does not support Zero-copy, fallback to traditional send.
+///
+/// # Blocking
+///
+/// The sender avoids blocking as much as possible.
+/// As long as there are free registered buffers to use, the sender should not block.
+///
+/// A dedicated thread is responsible for filling the submission queue and submitting requests for io-uring, with no-sleep, no IRQ and least amount of of syscalls.
+///
 #[derive(Debug, Clone)]
 pub struct ZcMulticastSender {
     free_buffer_rx: crossbeam_channel::Receiver<FreshSendPermit>,
     send_req_tx: crossbeam_channel::Sender<SendReqBatch>,
+    stats: Arc<GlobalSendStats>,
 }
 
 pub const DEFAULT_NUM_REGISTERED_BUFFERS: u16 = 10000;
@@ -528,14 +557,21 @@ pub const DEFAULT_SEND_REQ_CTX_SLAB_MULTIPLER: usize = 15;
 
 #[derive(Debug, Clone)]
 pub struct ZcMulticastSenderConfig {
-    num_registered_buffers: u16,
-    registered_buffer_size: usize,
+    pub num_registered_buffers: u16,
+    pub registered_buffer_size: usize,
     ///
     /// Queue depth of the submission queue.
     /// Note: must be a power of two.
-    ioring_queue_size: u32,
-    linger: usize,
-    core_id: CoreId,
+    pub ioring_queue_size: u32,
+    ///
+    /// Mimimim size to wait for submission queue to be before submitting to the kernel.
+    ///
+    pub linger: usize,
+
+    ///
+    /// Core ID to pin [`IoUring`]'s submission/completion event loop.
+    ///
+    pub core_id: CoreId,
     ///
     /// Internally, we use a slab to store inflight send req, this is because
     /// io-uring still need to access dest address information from a stable pointer.
@@ -545,7 +581,7 @@ pub struct ZcMulticastSenderConfig {
     ///
     /// Sizing hint: use a multipler that fit the number of destination address you want to support.
     ///
-    send_req_ctx_slab_mult: usize,
+    pub send_req_ctx_slab_mult: usize,
 }
 
 impl Default for ZcMulticastSenderConfig {
@@ -688,6 +724,13 @@ impl ZcMulticastSender {
         }
         Ok(())
     }
+
+    ///
+    /// Returns a owned reference to the global send stats.
+    ///
+    pub fn global_shared_stats(&self) -> Arc<GlobalSendStats> {
+        Arc::clone(&self.stats)
+    }
 }
 
 pub fn zc_multicast_sender(send_socket: UdpSocket) -> io::Result<ZcMulticastSender> {
@@ -762,7 +805,7 @@ pub fn zc_multicast_sender_with_config(
     }
 
     let send_socket_fd = types::Fd(send_socket.as_fd().as_raw_fd());
-    let stats = Arc::new(SendStats::default());
+    let stats = Arc::new(GlobalSendStats::default());
     let slab_fixed_cap = num_registered_buffers as usize * send_req_ctx_slab_mult;
     let send_req_ctx_slab = StableSlab::with_capacity(slab_fixed_cap);
     let ev_loop = IoUringEvLoop {
@@ -791,6 +834,7 @@ pub fn zc_multicast_sender_with_config(
     Ok(ZcMulticastSender {
         free_buffer_rx,
         send_req_tx,
+        stats,
     })
 }
 
