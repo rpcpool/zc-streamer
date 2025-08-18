@@ -15,9 +15,13 @@ use io_uring::{
     squeue::Entry,
     types,
 };
-use slab::Slab;
 use socket2::SockAddr;
 
+use crate::io_uring::stable_slab::StableSlab;
+
+///
+/// A buffer that is registered with the kernel for zero-copy sending.
+///
 struct RegisteredBuffer {
     index: u16,
     capacity: usize,
@@ -29,19 +33,27 @@ impl RegisteredBuffer {
         RegisteredBuffer {
             index: self.index,
             capacity: self.capacity,
-            buf: self.buf.clone(),
+            buf: self.buf,
         }
     }
 }
 
 unsafe impl Send for RegisteredBuffer {}
 
+///
+/// A permit for sending data using a registered buffer.
+///
+/// Only one thread can own a permit.
+///
 pub struct FreshSendPermit {
     rbuf: Option<RegisteredBuffer>,
     free_rbuf_tx: crossbeam_channel::Sender<FreshSendPermit>,
 }
 
 impl Drop for FreshSendPermit {
+    ///
+    /// Drop the permit and return the buffer to the free buffer channel.
+    ///
     fn drop(&mut self) {
         if let Some(rbuf) = self.rbuf.take() {
             // Return the buffer to the free buffer channel
@@ -49,16 +61,17 @@ impl Drop for FreshSendPermit {
                 rbuf: Some(rbuf),
                 free_rbuf_tx: self.free_rbuf_tx.clone(),
             };
-            match self.free_rbuf_tx.try_send(new_permit) {
-                Err(TrySendError::Full(_)) => {
-                    unreachable!("Free buffer channel should not be full");
-                }
-                _ => {}
+            if let Err(TrySendError::Full(_)) = self.free_rbuf_tx.try_send(new_permit) {
+                unreachable!("Free buffer channel should not be full");
             }
         }
     }
 }
 
+///
+/// A permit for sending data using a registered buffer.
+/// This permit is filled with data and can be sent to multiple destinations.
+///
 struct FilledSendPermit {
     rbuf: Option<RegisteredBuffer>,
     free_rbuf_tx: crossbeam_channel::Sender<FreshSendPermit>,
@@ -72,11 +85,8 @@ impl Drop for FilledSendPermit {
                 rbuf: Some(rbuf),
                 free_rbuf_tx: self.free_rbuf_tx.clone(),
             };
-            match self.free_rbuf_tx.try_send(new_permit) {
-                Err(TrySendError::Full(_)) => {
-                    unreachable!("Free buffer channel should not be full");
-                }
-                _ => {}
+            if let Err(TrySendError::Full(_)) = self.free_rbuf_tx.try_send(new_permit) {
+                unreachable!("Free buffer channel should not be full");
             }
         }
     }
@@ -160,10 +170,16 @@ impl RegisteredBuffer {
     }
 }
 
+///
+/// A batch of send requests.
+///
 pub struct SendReqBatch {
     batch: Vec<SendReq>,
 }
 
+///
+/// A send request.
+///
 pub struct SendReq {
     pub dests: Vec<SocketAddr>,
     rbuf: RegisteredBuffer,
@@ -176,9 +192,13 @@ struct SendReqContext {
     rbuf_index: u16,
 }
 
+///
+/// Maintain the reference-count to a registered buffer.
+/// Does not count its own reference to the [`RegisteredBuffer`].
+///
 struct RegisteredBufferRc {
     rbuf: RegisteredBuffer,
-    rc: u16,
+    rc: u16, /*the number of inflight send req that reference this registered buffer */
 }
 
 struct IoUringEvLoop {
@@ -188,7 +208,7 @@ struct IoUringEvLoop {
     send_socket_fd: types::Fd,
     backpressured_submissions: VecDeque<Entry>,
     free_buffer_tx: crossbeam_channel::Sender<FreshSendPermit>,
-    send_req_ctx_slab: Slab<SendReqContext>,
+    send_req_ctx_slab: StableSlab<SendReqContext>,
     send_req_rx: crossbeam_channel::Receiver<SendReqBatch>,
     registered_buffers_refcount_vec: Vec<RegisteredBufferRc>,
     linger: usize,
@@ -224,36 +244,25 @@ impl IoUringEvLoop {
         const IORING_SEND_ZC_REPORT_USAGE: u16 = 8;
 
         for dest in dests {
-            log::trace!("Building send operation to dest: {:?}", dest);
-            // let libc_dest_socket = into_libc_socketaddr(dest);
             let sockaddr = SockAddr::from(dest);
-            println!("sockaddr: {:?}, {}", sockaddr, sockaddr.len());
-
             let ctx = SendReqContext {
                 dest: sockaddr,
                 rbuf_index: buf_idx,
             };
-
+            let slab_key = self.send_req_ctx_slab.insert(ctx);
+            let ctx_ref = self.send_req_ctx_slab.get(slab_key).expect("get");
             let entry = SendZc::new(
                 self.send_socket_fd,
                 rbuf.buf.iov_base as *const _,
                 rbuf.buf.iov_len as _,
             )
             .buf_index(Some(buf_idx))
-            .dest_addr(ctx.dest.as_ptr() as *const _)
-            .dest_addr_len(ctx.dest.len())
+            .dest_addr(ctx_ref.dest.as_ptr() as *const _)
+            .dest_addr_len(ctx_ref.dest.len())
             .zc_flags(IORING_SEND_ZC_REPORT_USAGE)
             .build();
 
-            // THIS IS A HUGE HACK, since `dest_addr` must be a pointer,
-            // I need to point to a memory location that is valid for the lifetime of the operation.
-            // So I use the `user_data` field to store a pointer to the context.
-            let slab_key = self
-                .send_req_ctx_slab
-                .insert(ctx)
-                .try_into()
-                .expect("insert context into slab");
-            let entry = entry.user_data(slab_key);
+            let entry = entry.user_data(slab_key as u64);
 
             let submission_result = unsafe { self.ring.submission().push(&entry) };
 
@@ -339,25 +348,27 @@ impl IoUringEvLoop {
             fn from(cqe: cqueue::Entry) -> Self {
                 let res = cqe.result();
                 let user_data = cqe.user_data();
-                // ZC report usage doc: https://github.com/axboe/liburing/blob/e755a5f8614add34f44f0e89d1d1c1b2d21f1384/src/include/liburing/io_uring.h#L360
-                const IORING_NOTIF_USAGE_ZC_COPIED: i32 = 1i32 << 31;
-                let zero_copy = cqe.result() & IORING_NOTIF_USAGE_ZC_COPIED == 0;
-                // Strip zero-copy flag
-                let res = res & !IORING_NOTIF_USAGE_ZC_COPIED;
-                let err = if res < 0 {
-                    log::trace!("SendZc failed with -errno: {}", res);
-                    Some(std::io::Error::from_raw_os_error(-res))
-                } else {
-                    None
-                };
+
                 if more(cqe.flags()) {
-                    CqeResult::More {
-                        byte_sent: res as _,
-                        err,
-                    }
+                    let err = if res < 0 {
+                        Some(std::io::Error::from_raw_os_error(-res))
+                    } else {
+                        None
+                    };
+                    let byte_sent = if res < 0 { 0 } else { res as _ };
+                    CqeResult::More { byte_sent, err }
                 } else if notif(cqe.flags()) {
-                    assert!(notif(cqe.flags()));
+                    // ZC report usage doc: https://github.com/axboe/liburing/blob/e755a5f8614add34f44f0e89d1d1c1b2d21f1384/src/include/liburing/io_uring.h#L360
+                    const IORING_NOTIF_USAGE_ZC_COPIED: u32 = 1u32 << 31;
+                    let zero_copy = (res as u32) & IORING_NOTIF_USAGE_ZC_COPIED == 0;
                     let slab_key = user_data as usize;
+                    // Strip zero-copy flag
+                    let res2 = ((res as u32) & !IORING_NOTIF_USAGE_ZC_COPIED) as i32;
+                    let err = if res2 < 0 {
+                        Some(std::io::Error::from_raw_os_error(-res2))
+                    } else {
+                        None
+                    };
                     CqeResult::Completed {
                         slab_key,
                         zero_copy,
@@ -513,6 +524,7 @@ pub const DEFAULT_NUM_REGISTERED_BUFFERS: u16 = 10000;
 pub const DEFAULT_MTU_SIZE: usize = 1500;
 pub const DEFAULT_IORING_QUEUE_SIZE: u32 = 1024;
 pub const DEFAULT_LINGER: usize = 1;
+pub const DEFAULT_SEND_REQ_CTX_SLAB_MULTIPLER: usize = 15;
 
 #[derive(Debug, Clone)]
 pub struct ZcMulticastSenderConfig {
@@ -524,6 +536,16 @@ pub struct ZcMulticastSenderConfig {
     ioring_queue_size: u32,
     linger: usize,
     core_id: CoreId,
+    ///
+    /// Internally, we use a slab to store inflight send req, this is because
+    /// io-uring still need to access dest address information from a stable pointer.
+    /// the slab is fixed size and panic if we try to send more data then it can chew.
+    /// The [`ZcMulticastSenderConfig::send_req_ctx_slab_mult`] field controls the size of the slab.
+    /// The slab size is the number of `num_registered_buffers` * `send_req_ctx_slab_mult`.
+    ///
+    /// Sizing hint: use a multipler that fit the number of destination address you want to support.
+    ///
+    send_req_ctx_slab_mult: usize,
 }
 
 impl Default for ZcMulticastSenderConfig {
@@ -534,6 +556,7 @@ impl Default for ZcMulticastSenderConfig {
             ioring_queue_size: DEFAULT_IORING_QUEUE_SIZE,
             linger: DEFAULT_LINGER,
             core_id: core_affinity::get_core_ids().unwrap()[0],
+            send_req_ctx_slab_mult: DEFAULT_SEND_REQ_CTX_SLAB_MULTIPLER,
         }
     }
 }
@@ -681,6 +704,7 @@ pub fn zc_multicast_sender_with_config(
         ioring_queue_size,
         linger,
         core_id,
+        send_req_ctx_slab_mult,
     } = config;
 
     let ring = IoUring::builder()
@@ -698,7 +722,7 @@ pub fn zc_multicast_sender_with_config(
         // intermediate registered buffer
         let mut irbuf = vec![0u8; registered_buffer_size];
         let rbuf = RegisteredBuffer {
-            index: i as u16,
+            index: i,
             capacity: registered_buffer_size,
             buf: libc::iovec {
                 iov_base: irbuf.as_mut_ptr() as *mut _,
@@ -711,7 +735,7 @@ pub fn zc_multicast_sender_with_config(
 
     let mut iovecs = Vec::with_capacity(num_registered_buffers as _);
     for rbuf in rbuf_vec.iter() {
-        let iovec = rbuf.buf.clone();
+        let iovec = rbuf.buf;
         iovecs.push(iovec);
     }
 
@@ -739,8 +763,8 @@ pub fn zc_multicast_sender_with_config(
 
     let send_socket_fd = types::Fd(send_socket.as_fd().as_raw_fd());
     let stats = Arc::new(SendStats::default());
-    const SLAB_MULTIPLIER: usize = 15;
-    let send_req_ctx_slab = Slab::with_capacity(num_registered_buffers as usize * SLAB_MULTIPLIER);
+    let slab_fixed_cap = num_registered_buffers as usize * send_req_ctx_slab_mult;
+    let send_req_ctx_slab = StableSlab::with_capacity(slab_fixed_cap);
     let ev_loop = IoUringEvLoop {
         ring,
         send_socket,
@@ -772,8 +796,6 @@ pub fn zc_multicast_sender_with_config(
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
-
     use log::{LevelFilter, Metadata, Record, SetLoggerError};
     use rand::{RngCore, rng};
     use solana_net_utils::bind_to_localhost;
@@ -781,12 +803,15 @@ mod tests {
 
     use crate::io_uring::sendmmsg::zc_multicast_sender;
 
+    #[allow(dead_code)]
     static LOGGER: SimpleLogger = SimpleLogger;
 
+    #[allow(dead_code)]
     pub fn init() -> Result<(), SetLoggerError> {
         log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Trace))
     }
 
+    #[allow(dead_code)]
     struct SimpleLogger;
 
     impl log::Log for SimpleLogger {
@@ -827,7 +852,6 @@ mod tests {
 
     #[test]
     pub fn test_multicast() {
-        init().expect("Failed to initialize logger");
         log::error!("Starting multicast message test");
         let reader = bind_to_localhost().expect("bind");
         let addr = reader.local_addr().unwrap();
@@ -848,20 +872,17 @@ mod tests {
         let mut rng = rng();
         rng.fill_bytes(expected_packet.as_mut_slice());
 
-        log::trace!("dest1: {:?}", addr);
         mc_sender
             .send(&expected_packet, &[addr, addr2, addr3, addr4])
             .expect("send multicast");
-
         for rdr in [reader, reader2, reader3, reader4].iter() {
             let mut packets = vec![Packet::default(); 32];
+            log::trace!("Receiving packets on {:?}", rdr.local_addr());
             let recv = recv_mmsg(rdr, &mut packets[..]).unwrap();
             assert_eq!(1, recv);
             let actual = packets[0].data(..).unwrap();
             assert_eq!(actual.len(), expected_packet.len());
             assert_eq!(*actual, expected_packet[..]);
         }
-
-        thread::sleep(Duration::from_secs(1));
     }
 }
