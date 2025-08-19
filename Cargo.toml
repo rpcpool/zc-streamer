@@ -15,7 +15,8 @@ cli = [
     "dep:clap",
     "dep:humantime",
     "dep:ctrlc",
-    "dep:pretty_env_logger"
+    "dep:pretty_env_logger",
+    "dep:solana-streamer"
 ]
 
 [dependencies]
@@ -32,7 +33,12 @@ rand = "~0.9.2"
 slab = "0.4.11"
 socket2 = "0.6.0"
 solana-net-utils = "2"
+solana-streamer = { version = "2", optional = true }
 thiserror = "2"
 
 [dev-dependencies]
-solana-streamer = "2.3.7"
+solana-streamer = "2"
+
+
+[profile.release]
+debug = true

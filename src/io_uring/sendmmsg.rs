@@ -205,6 +205,61 @@ struct RegisteredBufferRc {
     rc: u16, /*the number of inflight send req that reference this registered buffer */
 }
 
+enum CqeResult {
+    More {
+        byte_sent: u32,
+        #[allow(dead_code)]
+        slab_key: usize,
+        err: Option<std::io::Error>,
+    },
+    Completed {
+        slab_key: usize,
+        zero_copy: bool,
+        err: Option<std::io::Error>,
+    },
+}
+
+impl From<cqueue::Entry> for CqeResult {
+    fn from(cqe: cqueue::Entry) -> Self {
+        let res = cqe.result();
+        let user_data = cqe.user_data();
+
+        if more(cqe.flags()) {
+            let err = if res < 0 {
+                Some(std::io::Error::from_raw_os_error(-res))
+            } else {
+                None
+            };
+            let byte_sent = if res < 0 { 0 } else { res as _ };
+            let slab_key = user_data as usize;
+            CqeResult::More {
+                byte_sent,
+                err,
+                slab_key,
+            }
+        } else if notif(cqe.flags()) {
+            // ZC report usage doc: https://github.com/axboe/liburing/blob/e755a5f8614add34f44f0e89d1d1c1b2d21f1384/src/include/liburing/io_uring.h#L360
+            const IORING_NOTIF_USAGE_ZC_COPIED: u32 = 1u32 << 31;
+            let zero_copy = (res as u32) & IORING_NOTIF_USAGE_ZC_COPIED == 0;
+            let slab_key = user_data as usize;
+            // Strip zero-copy flag
+            let res2 = ((res as u32) & !IORING_NOTIF_USAGE_ZC_COPIED) as i32;
+            let err = if res2 < 0 {
+                Some(std::io::Error::from_raw_os_error(-res2))
+            } else {
+                None
+            };
+            CqeResult::Completed {
+                slab_key,
+                zero_copy,
+                err,
+            }
+        } else {
+            panic!("cqe.flags(): {:?}", cqe.flags())
+        }
+    }
+}
+
 struct IoUringEvLoop {
     ring: IoUring,
     #[allow(dead_code)]
@@ -215,6 +270,7 @@ struct IoUringEvLoop {
     send_req_ctx_slab: StableSlab<SendReqContext>,
     send_req_rx: crossbeam_channel::Receiver<SendReqBatch>,
     registered_buffers_refcount_vec: Vec<RegisteredBufferRc>,
+    unprocess_completion_queue: Vec<CqeResult>,
     linger: usize,
     stats: Arc<GlobalSendStats>,
     disconnected: bool,
@@ -354,75 +410,23 @@ impl IoUringEvLoop {
         }
     }
 
+    fn drain_completion_queue(&mut self) {
+        let mut cq = self.ring.completion();
+        cq.sync();
+        // TODO: create a slab for this
+        for cqe in cq {
+            self.unprocess_completion_queue.push(cqe.into());
+        }
+    }
+
+    fn drain_and_process_cqe(&mut self) {
+        self.drain_completion_queue();
+        self.process_completion_queue();
+    }
+
     fn process_completion_queue(&mut self) {
-        enum CqeResult {
-            More {
-                byte_sent: u32,
-                #[allow(dead_code)]
-                slab_key: usize,
-                err: Option<std::io::Error>,
-            },
-            Completed {
-                slab_key: usize,
-                zero_copy: bool,
-                err: Option<std::io::Error>,
-            },
-        }
-
-        impl From<cqueue::Entry> for CqeResult {
-            fn from(cqe: cqueue::Entry) -> Self {
-                let res = cqe.result();
-                let user_data = cqe.user_data();
-
-                if more(cqe.flags()) {
-                    let err = if res < 0 {
-                        Some(std::io::Error::from_raw_os_error(-res))
-                    } else {
-                        None
-                    };
-                    let byte_sent = if res < 0 { 0 } else { res as _ };
-                    let slab_key = user_data as usize;
-                    CqeResult::More {
-                        byte_sent,
-                        err,
-                        slab_key,
-                    }
-                } else if notif(cqe.flags()) {
-                    // ZC report usage doc: https://github.com/axboe/liburing/blob/e755a5f8614add34f44f0e89d1d1c1b2d21f1384/src/include/liburing/io_uring.h#L360
-                    const IORING_NOTIF_USAGE_ZC_COPIED: u32 = 1u32 << 31;
-                    let zero_copy = (res as u32) & IORING_NOTIF_USAGE_ZC_COPIED == 0;
-                    let slab_key = user_data as usize;
-                    // Strip zero-copy flag
-                    let res2 = ((res as u32) & !IORING_NOTIF_USAGE_ZC_COPIED) as i32;
-                    let err = if res2 < 0 {
-                        Some(std::io::Error::from_raw_os_error(-res2))
-                    } else {
-                        None
-                    };
-                    CqeResult::Completed {
-                        slab_key,
-                        zero_copy,
-                        err,
-                    }
-                } else {
-                    panic!("cqe.flags(): {:?}", cqe.flags())
-                }
-            }
-        }
-
-        let cqe_vec = {
-            let mut cq = self.ring.completion();
-            cq.sync();
-            // TODO: create a slab for this
-            let mut cqe_vec = Vec::with_capacity(cq.len());
-            for cqe in cq {
-                let cqe = cqe.into();
-                cqe_vec.push(cqe);
-            }
-            cqe_vec
-        };
-
-        for cqe in cqe_vec {
+        let mut unprocessed_cq = std::mem::take(&mut self.unprocess_completion_queue);
+        while let Some(cqe) = unprocessed_cq.pop() {
             match cqe {
                 CqeResult::More {
                     byte_sent,
@@ -475,6 +479,7 @@ impl IoUringEvLoop {
                 }
             }
         }
+        let _ = std::mem::replace(&mut self.unprocess_completion_queue, unprocessed_cq);
     }
 
     fn fill_submissions(&mut self) -> usize {
@@ -506,33 +511,27 @@ impl IoUringEvLoop {
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
         {
-            self.process_completion_queue();
+            self.drain_and_process_cqe();
         }
     }
 
     pub fn ev_loop(mut self) {
         while !self.disconnected {
-            self.process_completion_queue();
+            self.drain_and_process_cqe();
             let total_submission = self.fill_submissions();
             if total_submission > 0 {
                 log::trace!("Filled {total_submission} submissions");
             }
-            if self.ring.submission().len() >= self.linger {
-                let t = std::time::Instant::now();
-                match self.ring.submit_and_wait(1) {
+            if self.ring.submission().is_full() || self.ring.submission().len() >= self.linger {
+                match self.ring.submit() {
                     Ok(submitted) => {
                         // You need to sync here otherwise you get unknown OS error codes.
                         // the doc does not say why, but it is likely due to the way the kernel handles
                         // the submission queue.
                         self.ring.submission().sync();
-                        let elapsed = t.elapsed();
                         self.stats
                             .submit_count
                             .fetch_add(submitted as u64, std::sync::atomic::Ordering::Relaxed);
-                        self.stats.submit_wait_cumu_time_ms.fetch_add(
-                            elapsed.as_millis() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
                     }
                     Err(e) => {
                         if e.raw_os_error() == Some(libc::EBUSY) {
@@ -773,8 +772,9 @@ pub fn zc_multicast_sender_with_config(
         send_req_ctx_slab_mult,
     } = config;
 
+    let cq_size = ioring_queue_size * 2;
     let ring = IoUring::builder()
-        .setup_cqsize(ioring_queue_size * 2)
+        .setup_cqsize(cq_size)
         .setup_sqpoll(100)
         .build(ioring_queue_size)?;
     log::trace!(
@@ -841,6 +841,7 @@ pub fn zc_multicast_sender_with_config(
         send_req_rx,
         send_req_ctx_slab,
         registered_buffers_refcount_vec: rbuf_rc_vec,
+        unprocess_completion_queue: Vec::with_capacity(cq_size as usize),
         linger,
         stats: Arc::clone(&stats),
         disconnected: false,

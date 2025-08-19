@@ -5,6 +5,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::spawn;
+use std::time::Instant;
 use std::{net::SocketAddr, str::FromStr, time::Duration};
 use zc_streamer::io_uring::sendmmsg::{
     GlobalSendStats, ZcMulticastSenderConfig, zc_multicast_sender_with_config,
@@ -48,6 +49,10 @@ enum Action {
     // Run multicast benchmark
     #[command(name = "mc")]
     Multicast(MulticastArgs),
+
+    // Run Solana streaming benchmark
+    #[command(name = "sendmmsg")]
+    SolanaStream(MulticastArgs),
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +93,85 @@ struct MulticastArgs {
     dests: Vec<String>,
 }
 
+fn run_solana_streamer_benchmark(args: MulticastArgs) {
+    const MINIMUM_CORE_NUM: usize = 3;
+    const IORING_CORE_IDX: usize = 2;
+    const SENDER_CORE_IDX: usize = 1;
+    const MAIN_CORE_IDX: usize = 0;
+
+    let dests: Vec<SocketAddr> = args
+        .dests
+        .iter()
+        .map(|dest| dest.parse().expect("invalid dest address"))
+        .collect();
+
+    let core_list = core_affinity::get_core_ids().expect("Failed to get core IDs");
+    if core_list.len() < MINIMUM_CORE_NUM {
+        writeln!(
+            std::io::stderr(),
+            "Not enough CPU cores available, requires at least 3"
+        )
+        .unwrap();
+        std::process::exit(1);
+    }
+
+    let sender_socket = solana_net_utils::bind_to_unspecified().expect("bind");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let sender_stop = Arc::clone(&stop);
+    let send_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let send_wait_cumu_time = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sender_send_wait_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sender_send_count = Arc::clone(&send_count);
+    let sender_core_idx = core_list[SENDER_CORE_IDX];
+    let sender_jh = spawn(move || {
+        core_affinity::set_for_current(sender_core_idx);
+        let mut rng = rng();
+        let dests = dests;
+        let mut packets = Vec::with_capacity(1024);
+
+        for _ in 0..1024 {
+            let mut packet = vec![0u8; 1232];
+            rng.fill_bytes(&mut packet);
+            packets.push(packet);
+        }
+        while !sender_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            // Send multicast packets
+            for dest in dests.iter() {
+                let packets_with_dest = packets
+                    .iter()
+                    .map(|p| (p.as_slice(), dest))
+                    .collect::<Vec<_>>();
+                let total = packets_with_dest.len();
+                let t = std::time::Instant::now();
+                solana_streamer::sendmmsg::batch_send(&sender_socket, packets_with_dest)
+                    .expect("multi_target_send");
+                let elapsed = t.elapsed();
+                sender_send_wait_count.fetch_add(
+                    elapsed.as_micros() as usize,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                sender_send_count.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+
+    core_affinity::set_for_current(core_list[MAIN_CORE_IDX]);
+    let mut i = 0;
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) && !sender_jh.is_finished() {
+        if i >= args.sample && args.sample > 0 {
+            break;
+        }
+        std::thread::sleep(args.print_interval.dur);
+        println!(
+            "solana_streamer::sendmmsg stats -- total_sender_cnt: {}, wait time cumu : {}",
+            send_count.load(std::sync::atomic::Ordering::Relaxed),
+            send_wait_cumu_time.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        i += 1;
+    }
+}
+
 fn run_multicast_benchmark(args: MulticastArgs) {
     pretty_env_logger::init();
     // Here you would implement the logic to run the multicast benchmark
@@ -116,7 +200,6 @@ fn run_multicast_benchmark(args: MulticastArgs) {
     let zc_sender_config = ZcMulticastSenderConfig {
         core_id: core_list[IORING_CORE_IDX],
         registered_buffer_size: 10_000,
-        // ioring_queue_size: 4096,
         ..Default::default()
     };
     let sender_socket = solana_net_utils::bind_to_unspecified().expect("bind");
@@ -134,17 +217,28 @@ fn run_multicast_benchmark(args: MulticastArgs) {
 
     let sender_stop = Arc::clone(&stop);
     let send_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let send_wait_cumu = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sender_send_count = Arc::clone(&send_count);
+    let sender_send_wait_count = Arc::clone(&send_wait_cumu);
     let zc_sender_jh = spawn(move || {
         core_affinity::set_for_current(sender_core_id);
         let mut rng = rng();
         let dests = dests;
+        let mut packet = vec![0u8; 1232];
+        rng.fill_bytes(&mut packet);
+        let packets = vec![packet; 1024];
         while !sender_stop.load(std::sync::atomic::Ordering::Relaxed) {
             // Send multicast packets
-            let mut packet = vec![0u8; 1232];
-            rng.fill_bytes(&mut packet);
-            zc_sender.send(&packet, dests.as_slice()).expect("send");
-            sender_send_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let t = Instant::now();
+            zc_sender
+                .cross_batch_send(&packets, dests.as_slice())
+                .expect("send");
+            let elapsed = t.elapsed();
+            sender_send_wait_count.fetch_add(
+                elapsed.as_millis() as usize,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            sender_send_count.fetch_add(1024 * dests.len(), std::sync::atomic::Ordering::Relaxed);
         }
     });
 
@@ -157,9 +251,10 @@ fn run_multicast_benchmark(args: MulticastArgs) {
         std::thread::sleep(args.print_interval.dur);
         let stats = stats.clone();
         println!(
-            "Multicast stats: {:?}, total_sender_cnt: {}",
+            "Multicast stats: {:?}, total_sender_cnt: {}, send wait cumu: {}",
             pretty_stats(&stats),
-            send_count.load(std::sync::atomic::Ordering::Relaxed)
+            send_count.load(std::sync::atomic::Ordering::Relaxed),
+            send_wait_cumu.load(std::sync::atomic::Ordering::Relaxed)
         );
         i += 1;
     }
@@ -199,6 +294,9 @@ fn main() {
     match args.action {
         Action::Multicast(mc_args) => {
             run_multicast_benchmark(mc_args);
+        }
+        Action::SolanaStream(mc_args) => {
+            run_solana_streamer_benchmark(mc_args);
         }
     }
 }

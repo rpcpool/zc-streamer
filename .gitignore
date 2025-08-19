@@ -1,3 +1,6 @@
 /target
 .local
 *.txt
+*.svg
+*.gz
+*.data
