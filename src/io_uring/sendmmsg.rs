@@ -189,8 +189,9 @@ pub struct SendReq {
 }
 
 #[derive(Debug)]
-#[repr(align(128))]
 struct SendReqContext {
+    #[allow(dead_code)]
+    seq_id: u64,
     dest: SockAddr,
     rbuf_index: u16,
 }
@@ -217,6 +218,7 @@ struct IoUringEvLoop {
     linger: usize,
     stats: Arc<GlobalSendStats>,
     disconnected: bool,
+    seq_id: u64,
 }
 
 #[derive(Debug, Default)]
@@ -239,6 +241,12 @@ impl IoUringEvLoop {
             .fold(0, |acc, req| acc + self.push_send_req(req))
     }
 
+    fn next_seq_id(&mut self) -> u64 {
+        let ret = self.seq_id;
+        self.seq_id += 1;
+        ret
+    }
+
     fn push_send_req(&mut self, send_req: SendReq) -> usize {
         let mut total_submissions = 0;
         let SendReq { dests, rbuf } = send_req;
@@ -252,6 +260,7 @@ impl IoUringEvLoop {
             let ctx = SendReqContext {
                 dest: sockaddr,
                 rbuf_index: buf_idx,
+                seq_id: self.next_seq_id(),
             };
             let slab_key = self.send_req_ctx_slab.insert(ctx);
             let ctx_ref = self.send_req_ctx_slab.get(slab_key).expect("get");
@@ -303,6 +312,9 @@ impl IoUringEvLoop {
             match unsafe { self.ring.submission().push(&op) } {
                 Ok(_) => {
                     // Successfully pushed the operation
+                    self.stats
+                        .inflight_send
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     total_submissions += 1;
                 }
                 Err(_e) => {
@@ -346,6 +358,8 @@ impl IoUringEvLoop {
         enum CqeResult {
             More {
                 byte_sent: u32,
+                #[allow(dead_code)]
+                slab_key: usize,
                 err: Option<std::io::Error>,
             },
             Completed {
@@ -367,7 +381,12 @@ impl IoUringEvLoop {
                         None
                     };
                     let byte_sent = if res < 0 { 0 } else { res as _ };
-                    CqeResult::More { byte_sent, err }
+                    let slab_key = user_data as usize;
+                    CqeResult::More {
+                        byte_sent,
+                        err,
+                        slab_key,
+                    }
                 } else if notif(cqe.flags()) {
                     // ZC report usage doc: https://github.com/axboe/liburing/blob/e755a5f8614add34f44f0e89d1d1c1b2d21f1384/src/include/liburing/io_uring.h#L360
                     const IORING_NOTIF_USAGE_ZC_COPIED: u32 = 1u32 << 31;
@@ -405,7 +424,11 @@ impl IoUringEvLoop {
 
         for cqe in cqe_vec {
             match cqe {
-                CqeResult::More { byte_sent, err } => {
+                CqeResult::More {
+                    byte_sent,
+                    err,
+                    slab_key: _,
+                } => {
                     log::trace!("SendZc more: {} bytes sent", byte_sent);
                     self.stats
                         .bytes_sent
@@ -496,7 +519,7 @@ impl IoUringEvLoop {
             }
             if self.ring.submission().len() >= self.linger {
                 let t = std::time::Instant::now();
-                match self.ring.submit() {
+                match self.ring.submit_and_wait(1) {
                     Ok(submitted) => {
                         // You need to sync here otherwise you get unknown OS error codes.
                         // the doc does not say why, but it is likely due to the way the kernel handles
@@ -510,10 +533,10 @@ impl IoUringEvLoop {
                             elapsed.as_millis() as u64,
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        log::trace!("Submitted {submitted} requests in {elapsed:?}");
                     }
                     Err(e) => {
                         if e.raw_os_error() == Some(libc::EBUSY) {
+                            log::debug!("EBUSY");
                             // need to remove some completion queue entry next loop.
                         } else {
                             log::error!("Failed to submit  {e:?}");
@@ -752,6 +775,7 @@ pub fn zc_multicast_sender_with_config(
 
     let ring = IoUring::builder()
         .setup_cqsize(ioring_queue_size * 2)
+        .setup_sqpoll(100)
         .build(ioring_queue_size)?;
     log::trace!(
         "zc_multicast_sender_with_config: io_uring queue size: {}",
@@ -820,6 +844,7 @@ pub fn zc_multicast_sender_with_config(
         linger,
         stats: Arc::clone(&stats),
         disconnected: false,
+        seq_id: 0,
     };
 
     log::trace!(
@@ -896,6 +921,7 @@ mod tests {
 
     #[test]
     pub fn test_multicast() {
+        init().expect("init logger");
         log::error!("Starting multicast message test");
         let reader = bind_to_localhost().expect("bind");
         let addr = reader.local_addr().unwrap();

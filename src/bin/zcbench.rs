@@ -1,7 +1,6 @@
 use clap::{Arg, Command, Parser};
 use log::{LevelFilter, Metadata, Record, SetLoggerError};
 use rand::{RngCore, rng};
-use std::env;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -116,6 +115,8 @@ fn run_multicast_benchmark(args: MulticastArgs) {
 
     let zc_sender_config = ZcMulticastSenderConfig {
         core_id: core_list[IORING_CORE_IDX],
+        registered_buffer_size: 10_000,
+        // ioring_queue_size: 4096,
         ..Default::default()
     };
     let sender_socket = solana_net_utils::bind_to_unspecified().expect("bind");
@@ -132,6 +133,8 @@ fn run_multicast_benchmark(args: MulticastArgs) {
     .expect("Error setting Ctrl-C handler");
 
     let sender_stop = Arc::clone(&stop);
+    let send_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sender_send_count = Arc::clone(&send_count);
     let zc_sender_jh = spawn(move || {
         core_affinity::set_for_current(sender_core_id);
         let mut rng = rng();
@@ -141,18 +144,23 @@ fn run_multicast_benchmark(args: MulticastArgs) {
             let mut packet = vec![0u8; 1232];
             rng.fill_bytes(&mut packet);
             zc_sender.send(&packet, dests.as_slice()).expect("send");
+            sender_send_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     });
 
     core_affinity::set_for_current(core_list[MAIN_CORE_IDX]);
     let mut i = 0;
-    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) && !zc_sender_jh.is_finished() {
         if i >= args.sample && args.sample > 0 {
             break;
         }
         std::thread::sleep(args.print_interval.dur);
         let stats = stats.clone();
-        println!("Multicast stats: {:?}", pretty_stats(&stats));
+        println!(
+            "Multicast stats: {:?}, total_sender_cnt: {}",
+            pretty_stats(&stats),
+            send_count.load(std::sync::atomic::Ordering::Relaxed)
+        );
         i += 1;
     }
 
