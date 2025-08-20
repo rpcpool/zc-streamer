@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::thread::spawn;
 use std::time::Instant;
 use std::{net::SocketAddr, str::FromStr, time::Duration};
-use zc_streamer::io_uring::sendmmsg::{
+use ioring_streamer::io_uring::sendmmsg::{
     GlobalSendStats, ZcMulticastSenderConfig, zc_multicast_sender_with_config,
 };
 
@@ -230,12 +230,13 @@ fn run_multicast_benchmark(args: MulticastArgs) {
         let dests = dests;
         let mut packet = vec![0u8; 1232];
         rng.fill_bytes(&mut packet);
+        let packet = Arc::from(packet.into_boxed_slice());
         let packets = vec![packet; 1024];
         while !sender_stop.load(std::sync::atomic::Ordering::Relaxed) {
             // Send multicast packets
             let t = Instant::now();
             zc_sender
-                .cross_batch_send(&packets, dests.as_slice())
+                .batch_send_copied(&packets, dests.as_slice())
                 .expect("send");
             let elapsed = t.elapsed();
             sender_send_wait_count.fetch_add(

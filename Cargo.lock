@@ -1279,6 +1279,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ioring-streamer"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "core_affinity",
+ "crossbeam-channel",
+ "ctrlc",
+ "humantime",
+ "io-uring",
+ "libc",
+ "log",
+ "nix",
+ "pretty_env_logger",
+ "rand 0.9.2",
+ "slab",
+ "socket2 0.6.0",
+ "solana-net-utils",
+ "solana-packet",
+ "solana-streamer",
+ "thiserror 2.0.15",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3606,28 +3629,6 @@ dependencies = [
  "quote",
  "syn 2.0.106",
  "synstructure 0.13.2",
-]
-
-[[package]]
-name = "zc-streamer"
-version = "0.1.0"
-dependencies = [
- "clap",
- "core_affinity",
- "crossbeam-channel",
- "ctrlc",
- "humantime",
- "io-uring",
- "libc",
- "log",
- "nix",
- "pretty_env_logger",
- "rand 0.9.2",
- "slab",
- "socket2 0.6.0",
- "solana-net-utils",
- "solana-streamer",
- "thiserror 2.0.15",
 ]
 
 [[package]]
