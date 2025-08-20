@@ -1,12 +1,7 @@
 use std::{
-    collections::VecDeque,
-    io, mem,
-    net::{SocketAddr, UdpSocket},
-    os::fd::{AsFd, AsRawFd},
-    sync::{
-        Arc,
-        atomic::{AtomicI32, AtomicU64},
-    },
+    collections::VecDeque, io, mem, net::{SocketAddr, UdpSocket}, os::fd::{AsFd, AsRawFd}, sync::{
+        atomic::{AtomicI32, AtomicU64}, Arc
+    }, thread::yield_now, time::{Duration, Instant}
 };
 
 use core_affinity::CoreId;
@@ -260,6 +255,30 @@ impl From<cqueue::Entry> for CqeResult {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SubmitLingerConfig {
+    ///
+    /// The ratio of the submission queue fill level to the total capacity
+    /// at which we call [`IoUring::submit`].
+    /// 
+    pub threshold_ratio: f64,
+    ///
+    /// The duration to wait before submitting the queued requests since last [`IoUring::submit`] call.
+    /// 
+    pub tick_duration: Duration,
+}
+pub const DEFAULT_SUBMIT_THRESHOLD_RATIO: f64 = 0.25;
+pub const DEFAULT_SUBMIT_TICK_DURATION: Duration = Duration::from_millis(1);
+
+impl Default for SubmitLingerConfig {
+    fn default() -> Self {
+        SubmitLingerConfig {
+            threshold_ratio: DEFAULT_SUBMIT_THRESHOLD_RATIO,
+            tick_duration: DEFAULT_SUBMIT_TICK_DURATION,
+        }
+    }
+}
+
 struct IoUringEvLoop {
     ring: IoUring,
     #[allow(dead_code)]
@@ -271,7 +290,7 @@ struct IoUringEvLoop {
     send_req_rx: crossbeam_channel::Receiver<SendReqBatch>,
     registered_buffers_refcount_vec: Vec<RegisteredBufferRc>,
     unprocess_completion_queue: Vec<CqeResult>,
-    linger: usize,
+    submit_linger_config: SubmitLingerConfig,
     stats: Arc<GlobalSendStats>,
     disconnected: bool,
     seq_id: u64,
@@ -356,11 +375,8 @@ impl IoUringEvLoop {
 
     fn try_drain_backpressured_submissions(&mut self) -> usize {
         let mut total_submissions = 0;
-        loop {
-            if self.ring.completion().is_full() {
-                // If the completion queue is full, we can't push more operations
-                break;
-            }
+
+        while !self.ring.submission().is_full() && !self.ring.completion().is_full() {
             let Some(op) = self.backpressured_submissions.pop_front() else {
                 // No more backpressured submissions to process
                 break;
@@ -421,10 +437,10 @@ impl IoUringEvLoop {
 
     fn drain_and_process_cqe(&mut self) {
         self.drain_completion_queue();
-        self.process_completion_queue();
+        self.process_cqe_results();
     }
 
-    fn process_completion_queue(&mut self) {
+    fn process_cqe_results(&mut self) {
         let mut unprocessed_cq = std::mem::take(&mut self.unprocess_completion_queue);
         while let Some(cqe) = unprocessed_cq.pop() {
             match cqe {
@@ -511,18 +527,26 @@ impl IoUringEvLoop {
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
         {
+            let _ = self.ring.submit();
+            self.ring.submission().sync();
             self.drain_and_process_cqe();
         }
     }
 
     pub fn ev_loop(mut self) {
+        let submit_linger_config = self.submit_linger_config.clone();
+        let max_sq_capacity = self.ring.submission().capacity();
+        let sq_fill_threshold = (max_sq_capacity as f64 * submit_linger_config.threshold_ratio) as usize;
+        let mut last_submit = Instant::now();
         while !self.disconnected {
             self.drain_and_process_cqe();
             let total_submission = self.fill_submissions();
             if total_submission > 0 {
                 log::trace!("Filled {total_submission} submissions");
-            }
-            if self.ring.submission().is_full() || self.ring.submission().len() >= self.linger {
+            }   
+            let elapsed = last_submit.elapsed();
+            if self.ring.submission().is_full() || self.ring.submission().len() >= sq_fill_threshold || elapsed >= submit_linger_config.tick_duration {
+                last_submit = Instant::now();
                 match self.ring.submit() {
                     Ok(submitted) => {
                         // You need to sync here otherwise you get unknown OS error codes.
@@ -586,9 +610,9 @@ pub struct ZcMulticastSenderConfig {
     /// Note: must be a power of two.
     pub ioring_queue_size: u32,
     ///
-    /// Mimimim size to wait for submission queue to be before submitting to the kernel.
+    /// See [`SubmitLingerConfig`] for more details.
     ///
-    pub linger: usize,
+    pub linger: SubmitLingerConfig,
 
     ///
     /// Core ID to pin [`IoUring`]'s submission/completion event loop.
@@ -612,7 +636,7 @@ impl Default for ZcMulticastSenderConfig {
             num_registered_buffers: DEFAULT_NUM_REGISTERED_BUFFERS,
             registered_buffer_size: DEFAULT_MTU_SIZE,
             ioring_queue_size: DEFAULT_IORING_QUEUE_SIZE,
-            linger: DEFAULT_LINGER,
+            linger: Default::default(),
             core_id: core_affinity::get_core_ids().unwrap()[0],
             send_req_ctx_slab_mult: DEFAULT_SEND_REQ_CTX_SLAB_MULTIPLER,
         }
@@ -630,7 +654,7 @@ impl ZcMulticastSenderConfig {
         self
     }
 
-    pub fn linger(mut self, linger: usize) -> Self {
+    pub fn linger(mut self, linger: SubmitLingerConfig) -> Self {
         self.linger = linger;
         self
     }
@@ -712,6 +736,8 @@ impl ZcMulticastSender {
                         num_msg -= 1;
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => {
+                        // println!("No free buffer available");
+                        yield_now();
                         break 'inner;
                     }
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -842,7 +868,7 @@ pub fn zc_multicast_sender_with_config(
         send_req_ctx_slab,
         registered_buffers_refcount_vec: rbuf_rc_vec,
         unprocess_completion_queue: Vec::with_capacity(cq_size as usize),
-        linger,
+        submit_linger_config: linger,
         stats: Arc::clone(&stats),
         disconnected: false,
         seq_id: 0,

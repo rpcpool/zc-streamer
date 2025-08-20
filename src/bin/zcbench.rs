@@ -87,6 +87,9 @@ struct MulticastArgs {
     #[clap(long, short, default_value = "0")]
     sample: i32,
 
+    #[clap(long, short, default_value = "0.0.0.0:0")]
+    bind: SocketAddr,
+
     ///
     /// Socket address to send packets to
     ///
@@ -115,8 +118,8 @@ fn run_solana_streamer_benchmark(args: MulticastArgs) {
         std::process::exit(1);
     }
 
-    let sender_socket = solana_net_utils::bind_to_unspecified().expect("bind");
-
+    let sender_socket = solana_net_utils::bind_to(args.bind.ip(), args.bind.port(), false).expect("bind");
+    println!("binded to {}", sender_socket.local_addr().unwrap());
     let stop = Arc::new(AtomicBool::new(false));
     let sender_stop = Arc::clone(&stop);
     let send_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -199,10 +202,11 @@ fn run_multicast_benchmark(args: MulticastArgs) {
 
     let zc_sender_config = ZcMulticastSenderConfig {
         core_id: core_list[IORING_CORE_IDX],
-        registered_buffer_size: 10_000,
+        registered_buffer_size: 50_000,
         ..Default::default()
     };
-    let sender_socket = solana_net_utils::bind_to_unspecified().expect("bind");
+    let sender_socket = solana_net_utils::bind_to(args.bind.ip(), args.bind.port(), false).expect("bind");
+    println!("binded to {}", sender_socket.local_addr().unwrap());
     let zc_sender =
         zc_multicast_sender_with_config(sender_socket, zc_sender_config).expect("zc_sender");
     let stats = zc_sender.global_shared_stats();
