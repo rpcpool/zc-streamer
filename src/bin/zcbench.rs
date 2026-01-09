@@ -1,6 +1,6 @@
 use clap::{Arg, Command, Parser};
 use ioring_streamer::io_uring::socket::{
-    GlobalSendStats, ZcMulticastSenderConfig, zc_multicast_sender_with_config,
+    GlobalSendStats, UringSocket, ZcMulticastSenderConfig, zc_multicast_sender_with_config
 };
 use log::{LevelFilter, Metadata, Record, SetLoggerError};
 use rand::{RngCore, rng};
@@ -210,7 +210,7 @@ fn run_multicast_benchmark(args: MulticastArgs) {
         solana_net_utils::bind_to(args.bind.ip(), args.bind.port(), false).expect("bind");
     println!("binded to {}", sender_socket.local_addr().unwrap());
     let zc_sender =
-        zc_multicast_sender_with_config(zc_sender_config, sender_socket).expect("zc_sender");
+        UringSocket::new(zc_sender_config, sender_socket).expect("zc_sender");
     let stats = zc_sender.global_shared_stats();
     let sender_core_id = core_list[SENDER_CORE_IDX];
     let stop = Arc::new(AtomicBool::new(false));
@@ -272,7 +272,7 @@ fn run_multicast_benchmark(args: MulticastArgs) {
 
 fn pretty_stats(stats: &GlobalSendStats) -> String {
     format!(
-        "Bytes sent: {}, Last Errno: {}. Errno count: {}, ZC send count: {}, Copied send count: {}, Submit count: {}, Submit wait cumulative time (ms): {}, Inflight send: {}",
+        "Bytes sent: {}, Last Errno: {}. Errno count: {}, ZC send count: {}, Copied send count: {}, Submit wait cumulative time (ms): {}, Inflight send: {}",
         stats.bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
         stats.last_errno.load(std::sync::atomic::Ordering::Relaxed),
         stats.errno_count.load(std::sync::atomic::Ordering::Relaxed),
@@ -281,9 +281,6 @@ fn pretty_stats(stats: &GlobalSendStats) -> String {
             .load(std::sync::atomic::Ordering::Relaxed),
         stats
             .copied_send_count
-            .load(std::sync::atomic::Ordering::Relaxed),
-        stats
-            .submit_count
             .load(std::sync::atomic::Ordering::Relaxed),
         stats
             .submit_wait_cumu_time_ms
