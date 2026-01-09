@@ -24,6 +24,7 @@ cli = [
 ]
 
 [dependencies]
+bytes = { version = "1.0.0" }
 clap = { version = "4", features = ["derive"], optional = true }
 core_affinity = "~0.8.3"
 crossbeam-channel = "~0.5.15"

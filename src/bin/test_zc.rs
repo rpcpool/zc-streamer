@@ -1,12 +1,12 @@
+use libc::{
+    AF_INET, MSG_ERRQUEUE, MSG_ZEROCOPY, POLLOUT, SO_ZEROCOPY, SOL_SOCKET, c_int, eventfd, iovec,
+    msghdr, poll, pollfd, recvmsg, sendmsg, setsockopt, sockaddr_in, sockaddr_storage,
+};
 use std::net::{SocketAddr, SocketAddrV4};
-use std::{mem, ptr};
+use std::os::unix::io::AsRawFd;
 use std::thread::yield_now;
 use std::{io, net::UdpSocket};
-use std::os::unix::io::AsRawFd;
-use libc::{c_int, eventfd, iovec, msghdr, poll, pollfd, recvmsg, sendmsg, setsockopt, sockaddr_in, sockaddr_storage, AF_INET, MSG_ERRQUEUE, MSG_ZEROCOPY, POLLOUT, SOL_SOCKET, SO_ZEROCOPY};
-
-
-
+use std::{mem, ptr};
 
 fn main2() {
     const SIZE_OF_SOCKADDR_IN: usize = mem::size_of::<sockaddr_in>();
@@ -20,7 +20,14 @@ fn main2() {
         let fd = sock.as_raw_fd();
 
         let one: c_int = 1;
-        if setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &one as *const _ as *const _, std::mem::size_of::<c_int>() as u32) < 0 {
+        if setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_ZEROCOPY,
+            &one as *const _ as *const _,
+            std::mem::size_of::<c_int>() as u32,
+        ) < 0
+        {
             eprintln!("setsockopt SO_ZEROCOPY failed");
             return;
         }
@@ -29,10 +36,7 @@ fn main2() {
         let SocketAddr::V4(addr_v4) = addr else {
             panic!("not ipv4");
         };
-        ptr::write(
-            ptr,
-            *nix::sys::socket::SockaddrIn::from(addr_v4).as_ref(),
-        );
+        ptr::write(ptr, *nix::sys::socket::SockaddrIn::from(addr_v4).as_ref());
         ptr::write_bytes(
             (ptr as *mut u8).add(SIZE_OF_SOCKADDR_IN),
             0,
@@ -76,7 +80,6 @@ fn main2() {
     }
 }
 
-
 fn main() {
     let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
     sock.connect("10.43.4.114:60599").unwrap();
@@ -84,13 +87,20 @@ fn main() {
 
     let one: c_int = 1;
     unsafe {
-        if setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &one as *const _ as *const _, std::mem::size_of::<c_int>() as u32) < 0 {
+        if setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_ZEROCOPY,
+            &one as *const _ as *const _,
+            std::mem::size_of::<c_int>() as u32,
+        ) < 0
+        {
             eprintln!("setsockopt SO_ZEROCOPY failed");
             return;
         }
     }
 
-    let buf = vec![0xFFu8; 1024*50];
+    let buf = vec![0xFFu8; 1024 * 50];
     unsafe {
         let ret = libc::send(fd, buf.as_ptr() as *const _, buf.len(), MSG_ZEROCOPY);
         if ret < 0 {
@@ -159,7 +169,10 @@ fn read_notification(msg: msghdr) {
             println!("Received control message:");
             println!("  Level: {}", level);
             println!("  Type: {}", type_);
-            println!("  Data: {:?}", std::slice::from_raw_parts(data as *const u8, len as usize));
+            println!(
+                "  Data: {:?}",
+                std::slice::from_raw_parts(data as *const u8, len as usize)
+            );
         }
     }
 }

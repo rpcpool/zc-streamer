@@ -1,4 +1,7 @@
 use clap::{Arg, Command, Parser};
+use ioring_streamer::io_uring::socket::{
+    GlobalSendStats, ZcMulticastSenderConfig, zc_multicast_sender_with_config,
+};
 use log::{LevelFilter, Metadata, Record, SetLoggerError};
 use rand::{RngCore, rng};
 use std::io::Write;
@@ -7,9 +10,6 @@ use std::sync::atomic::AtomicBool;
 use std::thread::spawn;
 use std::time::Instant;
 use std::{net::SocketAddr, str::FromStr, time::Duration};
-use ioring_streamer::io_uring::sendmmsg::{
-    GlobalSendStats, ZcMulticastSenderConfig, zc_multicast_sender_with_config,
-};
 
 static LOGGER: SimpleLogger = SimpleLogger;
 
@@ -97,10 +97,10 @@ struct MulticastArgs {
 }
 
 fn run_solana_streamer_benchmark(args: MulticastArgs) {
-    const MINIMUM_CORE_NUM: usize = 3;
-    const IORING_CORE_IDX: usize = 2;
-    const SENDER_CORE_IDX: usize = 1;
-    const MAIN_CORE_IDX: usize = 0;
+    const MINIMUM_CORE_NUM: usize = 4;
+    const IORING_CORE_IDX: usize = 3;
+    const SENDER_CORE_IDX: usize = 2;
+    const MAIN_CORE_IDX: usize = 1;
 
     let dests: Vec<SocketAddr> = args
         .dests
@@ -118,7 +118,8 @@ fn run_solana_streamer_benchmark(args: MulticastArgs) {
         std::process::exit(1);
     }
 
-    let sender_socket = solana_net_utils::bind_to(args.bind.ip(), args.bind.port(), false).expect("bind");
+    let sender_socket =
+        solana_net_utils::bind_to(args.bind.ip(), args.bind.port(), false).expect("bind");
     println!("binded to {}", sender_socket.local_addr().unwrap());
     let stop = Arc::new(AtomicBool::new(false));
     let sender_stop = Arc::clone(&stop);
@@ -151,7 +152,7 @@ fn run_solana_streamer_benchmark(args: MulticastArgs) {
                     .expect("multi_target_send");
                 let elapsed = t.elapsed();
                 sender_send_wait_count.fetch_add(
-                    elapsed.as_micros() as usize,
+                    elapsed.as_millis() as usize,
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 sender_send_count.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
@@ -179,10 +180,10 @@ fn run_multicast_benchmark(args: MulticastArgs) {
     pretty_env_logger::init();
     // Here you would implement the logic to run the multicast benchmark
     // using the provided arguments.
-    const MINIMUM_CORE_NUM: usize = 3;
-    const IORING_CORE_IDX: usize = 2;
-    const SENDER_CORE_IDX: usize = 1;
-    const MAIN_CORE_IDX: usize = 0;
+    const MINIMUM_CORE_NUM: usize = 4;
+    const IORING_CORE_IDX: usize = 3;
+    const SENDER_CORE_IDX: usize = 2;
+    const MAIN_CORE_IDX: usize = 1;
 
     let dests: Vec<SocketAddr> = args
         .dests
@@ -201,14 +202,15 @@ fn run_multicast_benchmark(args: MulticastArgs) {
     }
 
     let zc_sender_config = ZcMulticastSenderConfig {
-        core_id: core_list[IORING_CORE_IDX],
+        core_id: Some(core_list[IORING_CORE_IDX]),
         registered_buffer_size: 50_000,
         ..Default::default()
     };
-    let sender_socket = solana_net_utils::bind_to(args.bind.ip(), args.bind.port(), false).expect("bind");
+    let sender_socket =
+        solana_net_utils::bind_to(args.bind.ip(), args.bind.port(), false).expect("bind");
     println!("binded to {}", sender_socket.local_addr().unwrap());
     let zc_sender =
-        zc_multicast_sender_with_config(sender_socket, zc_sender_config).expect("zc_sender");
+        zc_multicast_sender_with_config(zc_sender_config, sender_socket).expect("zc_sender");
     let stats = zc_sender.global_shared_stats();
     let sender_core_id = core_list[SENDER_CORE_IDX];
     let stop = Arc::new(AtomicBool::new(false));
@@ -230,13 +232,12 @@ fn run_multicast_benchmark(args: MulticastArgs) {
         let dests = dests;
         let mut packet = vec![0u8; 1232];
         rng.fill_bytes(&mut packet);
-        let packet = Arc::from(packet.into_boxed_slice());
         let packets = vec![packet; 1024];
         while !sender_stop.load(std::sync::atomic::Ordering::Relaxed) {
             // Send multicast packets
             let t = Instant::now();
             zc_sender
-                .batch_send_copied(&packets, dests.as_slice())
+                .batch_send_copied(packets.clone(), dests.as_slice())
                 .expect("send");
             let elapsed = t.elapsed();
             sender_send_wait_count.fetch_add(

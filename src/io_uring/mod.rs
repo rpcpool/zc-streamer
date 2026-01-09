@@ -1,2 +1,2 @@
-pub mod sendmmsg;
+pub mod socket;
 pub(crate) mod stable_slab;

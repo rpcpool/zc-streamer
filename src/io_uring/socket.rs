@@ -1,18 +1,35 @@
-use std::{
-    alloc::{alloc, Layout}, collections::VecDeque, io, net::{SocketAddr, UdpSocket}, os::fd::{AsFd, AsRawFd}, sync::{
-        atomic::{AtomicI32, AtomicU64}, Arc
-    }, thread::yield_now, time::{Duration, Instant}
-};
+use crate::io_uring::stable_slab::StableSlab;
+use bytes::Bytes;
 use core_affinity::CoreId;
 use crossbeam_channel::{Sender, TrySendError};
 use io_uring::{
-    cqueue::{self, more, notif}, opcode, squeue::Entry, types, IoUring
+    IoUring,
+    cqueue::{self, more, notif},
+    opcode,
+    squeue::Entry,
+    types,
 };
 use socket2::SockAddr;
 use solana_packet::Packet;
 use solana_streamer::recvmmsg::recv_mmsg;
+use std::{
+    alloc::{Layout, alloc},
+    collections::VecDeque,
+    io,
+    net::{SocketAddr, UdpSocket},
+    os::fd::{AsFd, AsRawFd},
+    sync::{
+        Arc,
+        atomic::{AtomicI32, AtomicU64},
+    },
+    thread::yield_now,
+    time::{Duration, Instant},
+};
 
-use crate::io_uring::stable_slab::StableSlab;
+pub const IPV4_COMMON_UDP_MTU: usize = 1300;
+pub const IPV4_UDP_METADATA_SIZE: usize = 28; // 20 (IP header) + 8 (UDP header)
+
+pub const IPV4_PACKET_MTU: usize = IPV4_COMMON_UDP_MTU - IPV4_UDP_METADATA_SIZE; // 1300 - 20 (UDP + IP headers)
 
 ///
 /// A buffer that is registered with the kernel for zero-copy sending.
@@ -176,7 +193,7 @@ pub struct SendReqBatch {
 #[derive(Debug)]
 enum BufferFlavor {
     Registered(RegisteredBuffer),
-    Userspace(Arc<[u8]>),
+    Userspace(Bytes),
 }
 
 ///
@@ -266,7 +283,7 @@ impl From<cqueue::Entry> for CqeResult {
         } else {
             // Normal Send
             let slab_key = user_data as usize;
-            let result  = if res < 0 {
+            let result = if res < 0 {
                 Err(std::io::Error::from_raw_os_error(-res))
             } else {
                 Ok(res as usize)
@@ -281,11 +298,11 @@ pub struct SubmitLingerConfig {
     ///
     /// The ratio of the submission queue fill level to the total capacity
     /// at which we call [`IoUring::submit`].
-    /// 
+    ///
     pub threshold_ratio: f64,
     ///
     /// The duration to wait before submitting the queued requests since last [`IoUring::submit`] call.
-    /// 
+    ///
     pub tick_duration: Duration,
 }
 pub const DEFAULT_SUBMIT_THRESHOLD_RATIO: f64 = 0.25;
@@ -300,7 +317,7 @@ impl Default for SubmitLingerConfig {
     }
 }
 
-struct IoUringEvLoop {
+struct UringEvLoop {
     ring: IoUring,
     #[allow(dead_code)]
     send_socket: UdpSocket,
@@ -331,7 +348,7 @@ pub struct GlobalSendStats {
     pub inflight_send: AtomicU64,
 }
 
-impl IoUringEvLoop {
+impl UringEvLoop {
     fn push_send_req_batch(&mut self, send_req: SendReqBatch) -> usize {
         send_req
             .batch
@@ -354,15 +371,14 @@ impl IoUringEvLoop {
         }
     }
 
-    fn push_send_req_copied(&mut self, dests: Vec<SocketAddr>, buf: Arc<[u8]>) -> usize {
-
+    fn push_send_req_copied(&mut self, dests: Vec<SocketAddr>, buf: Bytes) -> usize {
         let mut total_submissions = 0;
 
         for dest in dests {
             let sockaddr = SockAddr::from(dest);
             let ctx = SendReqContext {
                 dest: sockaddr,
-                buffer: BufferFlavor::Userspace(Arc::clone(&buf)),
+                buffer: BufferFlavor::Userspace(buf.clone()),
                 seq_id: self.next_seq_id(),
             };
             let slab_key = self.send_req_ctx_slab.insert(ctx);
@@ -569,7 +585,7 @@ impl IoUringEvLoop {
                             .errno_count
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                },
+                }
                 CqeResult::SendResult { slab_key, result } => {
                     let ctx = self.send_req_ctx_slab.remove(slab_key);
                     let BufferFlavor::Userspace(_) = ctx.buffer else {
@@ -581,7 +597,9 @@ impl IoUringEvLoop {
                             self.stats
                                 .bytes_sent
                                 .fetch_add(bytes_sent as _, std::sync::atomic::Ordering::Relaxed);
-                            self.stats.copied_send_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.stats
+                                .copied_send_count
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         Err(e) => {
                             log::error!("Send failed with -errno: {e:?}");
@@ -641,16 +659,20 @@ impl IoUringEvLoop {
     pub fn ev_loop(mut self) {
         let submit_linger_config = self.submit_linger_config.clone();
         let max_sq_capacity = self.ring.submission().capacity();
-        let sq_fill_threshold = (max_sq_capacity as f64 * submit_linger_config.threshold_ratio) as usize;
+        let sq_fill_threshold =
+            (max_sq_capacity as f64 * submit_linger_config.threshold_ratio) as usize;
         let mut last_submit = Instant::now();
         while !self.disconnected {
             self.drain_and_process_cqe();
             let total_submission = self.fill_submissions();
             if total_submission > 0 {
                 log::trace!("Filled {total_submission} submissions");
-            }   
+            }
             let elapsed = last_submit.elapsed();
-            if self.ring.submission().is_full() || self.ring.submission().len() >= sq_fill_threshold || elapsed >= submit_linger_config.tick_duration {
+            if self.ring.submission().is_full()
+                || self.ring.submission().len() >= sq_fill_threshold
+                || elapsed >= submit_linger_config.tick_duration
+            {
                 last_submit = Instant::now();
                 match self.ring.submit() {
                     Ok(submitted) => {
@@ -694,10 +716,11 @@ impl IoUringEvLoop {
 /// A dedicated thread is responsible for filling the submission queue and submitting requests for io-uring, with no-sleep, no IRQ and least amount of of syscalls.
 ///
 #[derive(Debug, Clone)]
-pub struct PacketSender {
+pub struct UringSocket {
     free_rbuffer_rx: crossbeam_channel::Receiver<FreshSendPermit>,
     send_req_tx: crossbeam_channel::Sender<SendReqBatch>,
     stats: Arc<GlobalSendStats>,
+    packet_mtu: usize,
 }
 
 pub const DEFAULT_NUM_REGISTERED_BUFFERS: u16 = 10000;
@@ -722,7 +745,7 @@ pub struct ZcMulticastSenderConfig {
     ///
     /// Core ID to pin [`IoUring`]'s submission/completion event loop.
     ///
-    pub core_id: CoreId,
+    pub core_id: Option<CoreId>,
     ///
     /// Internally, we use a slab to store inflight send req, this is because
     /// io-uring still need to access dest address information from a stable pointer.
@@ -733,6 +756,8 @@ pub struct ZcMulticastSenderConfig {
     /// Sizing hint: use a multipler that fit the number of destination address you want to support.
     ///
     pub send_req_ctx_slab_mult: usize,
+
+    pub packet_mtu: usize,
 }
 
 impl Default for ZcMulticastSenderConfig {
@@ -742,8 +767,9 @@ impl Default for ZcMulticastSenderConfig {
             registered_buffer_size: DEFAULT_MTU_SIZE,
             ioring_queue_size: DEFAULT_IORING_QUEUE_SIZE,
             linger: Default::default(),
-            core_id: core_affinity::get_core_ids().unwrap()[0],
+            core_id: core_affinity::get_core_ids().and_then(|ids| ids.first().cloned()),
             send_req_ctx_slab_mult: DEFAULT_SEND_REQ_CTX_SLAB_MULTIPLER,
+            packet_mtu: IPV4_PACKET_MTU,
         }
     }
 }
@@ -764,7 +790,7 @@ impl ZcMulticastSenderConfig {
         self
     }
 
-    pub fn core_id(mut self, core_id: CoreId) -> Self {
+    pub fn core_id(mut self, core_id: Option<CoreId>) -> Self {
         self.core_id = core_id;
         self
     }
@@ -802,7 +828,11 @@ impl SendReqBatcher {
     }
 }
 
-impl PacketSender {
+impl UringSocket {
+    pub fn new(config: ZcMulticastSenderConfig, udp_socket: UdpSocket) -> io::Result<Self> {
+        zc_multicast_sender_with_config(config, udp_socket)
+    }
+
     pub fn send_zc<Src>(&self, src: Src, dests: &[SocketAddr]) -> Result<(), SendError>
     where
         Src: AsRef<[u8]>,
@@ -815,35 +845,65 @@ impl PacketSender {
         permit.send(data, dests, &self.send_req_tx)
     }
 
-    pub fn send_copied(&self, buf: Arc<[u8]>, dests: &[SocketAddr]) -> Result<(), SendError>
+    pub fn send<T>(&self, buf: T, dests: &[SocketAddr]) -> Result<(), SendError>
+    where
+        T: AsRef<[u8]> + Send + 'static,
     {
+        assert!(
+            buf.as_ref().len() <= self.packet_mtu,
+            "Buffer size {} exceeds MTU {}",
+            buf.as_ref().len(),
+            self.packet_mtu
+        );
+        let buf = Bytes::from_owner(buf);
         let send_req = SendReq {
             dests: dests.to_vec(),
-            buf: BufferFlavor::Userspace(buf)
+            buf: BufferFlavor::Userspace(buf),
         };
         self.send_req_tx
             .send(send_req.into())
             .map_err(|_| SendError::Disconnected)
     }
 
-    pub fn send_auto(&self, buf: Arc<[u8]>, dests: &[SocketAddr]) -> Result<(), SendError> {
+    pub fn send_auto<T>(&self, buf: T, dests: &[SocketAddr]) -> Result<(), SendError>
+    where
+        T: AsRef<[u8]> + Send + 'static,
+    {
+        let buf = Bytes::from_owner(buf);
+        assert!(
+            buf.as_ref().len() <= self.packet_mtu,
+            "Buffer size {} exceeds MTU {}",
+            buf.as_ref().len(),
+            self.packet_mtu
+        );
         match self.free_rbuffer_rx.try_recv() {
             Ok(permit) => permit.send(buf, dests, &self.send_req_tx),
-            Err(crossbeam_channel::TryRecvError::Empty) => {
-                self.send_copied(buf, dests)
-            }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                Err(SendError::Disconnected)
-            }
+            Err(crossbeam_channel::TryRecvError::Empty) => self.send(buf, dests),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(SendError::Disconnected),
         }
     }
 
-    pub fn batch_send_copied(&self, bufvec: &[Arc<[u8]>], dests: &[SocketAddr]) -> Result<(), SendError> {
+    pub fn batch_send_copied<T>(
+        &self,
+        bufvec: impl IntoIterator<Item = T>,
+        dests: &[SocketAddr],
+    ) -> Result<(), SendError>
+    where
+        T: AsRef<[u8]> + Send + 'static,
+    {
         let send_reqs: Vec<SendReq> = bufvec
-            .iter()
-            .map(|buf| SendReq {
-                dests: dests.to_vec(),
-                buf: BufferFlavor::Userspace(Arc::clone(buf))
+            .into_iter()
+            .map(|buf| {
+                assert!(
+                    buf.as_ref().len() <= self.packet_mtu,
+                    "Buffer size {} exceeds MTU {}",
+                    buf.as_ref().len(),
+                    self.packet_mtu
+                );
+                SendReq {
+                    dests: dests.to_vec(),
+                    buf: BufferFlavor::Userspace(Bytes::from_owner(buf)),
+                }
             })
             .collect();
         self.send_req_tx
@@ -857,11 +917,7 @@ impl PacketSender {
     /// This function will block until all messages are sent.
     ///
     /// Try to build the biggest batch possible if enough permits are available to do so.
-    pub fn batch_send_zc<Src>(
-        &self,
-        src_vec: &[Src],
-        dests: &[SocketAddr],
-    ) -> Result<(), SendError>
+    pub fn batch_send_zc<Src>(&self, src_vec: &[Src], dests: &[SocketAddr]) -> Result<(), SendError>
     where
         Src: AsRef<[u8]>,
     {
@@ -905,6 +961,12 @@ impl PacketSender {
             };
             for permit in permits.drain(..) {
                 let data = src_vec.get(src_i).expect("batch_send");
+                assert!(
+                    data.as_ref().len() <= self.packet_mtu,
+                    "Buffer size {} exceeds MTU {}",
+                    data.as_ref().len(),
+                    self.packet_mtu
+                );
                 src_i += 1;
                 let stored = permit.store(data)?;
                 batcher.batch.push(stored);
@@ -922,14 +984,14 @@ impl PacketSender {
     }
 }
 
-pub fn zc_multicast_sender(send_socket: UdpSocket) -> io::Result<PacketSender> {
-    zc_multicast_sender_with_config(send_socket, ZcMulticastSenderConfig::default())
+pub fn usk(send_socket: UdpSocket) -> io::Result<UringSocket> {
+    zc_multicast_sender_with_config(ZcMulticastSenderConfig::default(), send_socket)
 }
 
 pub fn zc_multicast_sender_with_config(
-    send_socket: UdpSocket,
     config: ZcMulticastSenderConfig,
-) -> io::Result<PacketSender> {
+    send_socket: UdpSocket,
+) -> io::Result<UringSocket> {
     let ZcMulticastSenderConfig {
         num_registered_buffers,
         registered_buffer_size,
@@ -937,6 +999,7 @@ pub fn zc_multicast_sender_with_config(
         linger,
         core_id,
         send_req_ctx_slab_mult,
+        packet_mtu,
     } = config;
 
     let cq_size = ioring_queue_size * 2;
@@ -1002,7 +1065,7 @@ pub fn zc_multicast_sender_with_config(
     let stats = Arc::new(GlobalSendStats::default());
     let slab_fixed_cap = num_registered_buffers as usize * send_req_ctx_slab_mult;
     let send_req_ctx_slab = StableSlab::with_capacity(slab_fixed_cap);
-    let ev_loop = IoUringEvLoop {
+    let ev_loop = UringEvLoop {
         ring,
         send_socket,
         send_socket_fd,
@@ -1023,15 +1086,20 @@ pub fn zc_multicast_sender_with_config(
         "zc_multicast_sender_with_config: starting event loop on core {:?}",
         core_id
     );
-    let _jh = std::thread::spawn(move || {
-        core_affinity::set_for_current(core_id);
-        ev_loop.ev_loop();
-    });
+    let _jh = std::thread::Builder::new()
+        .name("uring-zc-mc-sender".to_string())
+        .spawn(move || {
+            if let Some(core_id) = core_id {
+                core_affinity::set_for_current(core_id);
+            }
+            ev_loop.ev_loop();
+        })?;
 
-    Ok(PacketSender {
+    Ok(UringSocket {
         free_rbuffer_rx: free_buffer_rx,
         send_req_tx,
         stats,
+        packet_mtu,
     })
 }
 
@@ -1044,7 +1112,7 @@ mod tests {
     use solana_net_utils::bind_to_localhost;
     use solana_streamer::{packet::Packet, recvmmsg::recv_mmsg};
 
-    use crate::io_uring::sendmmsg::{recv_mmsg_exact, zc_multicast_sender};
+    use crate::io_uring::socket::{recv_mmsg_exact, usk};
 
     #[allow(dead_code)]
     static LOGGER: SimpleLogger = SimpleLogger;
@@ -1082,7 +1150,7 @@ mod tests {
         let reader = bind_to_localhost().expect("bind");
         let addr = reader.local_addr().unwrap();
         let sender_socket = bind_to_localhost().expect("bind");
-        let mc_sender = zc_multicast_sender(sender_socket).expect("zc_multicast_sender");
+        let mc_sender = usk(sender_socket).expect("zc_multicast_sender");
         let packet = Packet::default();
         mc_sender
             .send_zc(packet.data(..).unwrap(), &[addr])
@@ -1099,13 +1167,11 @@ mod tests {
         let reader = bind_to_localhost().expect("bind");
         let addr = reader.local_addr().unwrap();
         let sender_socket = bind_to_localhost().expect("bind");
-        let mc_sender = zc_multicast_sender(sender_socket).expect("zc_multicast_sender");
+        let mc_sender = usk(sender_socket).expect("zc_multicast_sender");
         let packet = vec![0u8; 1232];
         let box_packet = packet.into_boxed_slice();
         let packet: Arc<[u8]> = Arc::from(box_packet);
-        mc_sender
-            .send_copied(packet, &[addr])
-            .expect("send multicast");
+        mc_sender.send(packet, &[addr]).expect("send multicast");
 
         let mut packets = vec![Packet::default(); 32];
         let recv = recv_mmsg(&reader, &mut packets[..]).unwrap();
@@ -1114,7 +1180,7 @@ mod tests {
 
     #[test]
     pub fn test_batch_send_copied() {
-        init().expect("init logger");
+        // init().expect("init logger");
         const NUM_READERS: usize = 1;
         const NUM_PACKETS: usize = 64;
         let mut reader_socket_vec = Vec::with_capacity(NUM_READERS);
@@ -1127,14 +1193,12 @@ mod tests {
 
         let sender_socket = bind_to_localhost().expect("bind");
 
-        let mc_sender = zc_multicast_sender(sender_socket).expect("zc_multicast_sender");
+        let mc_sender = usk(sender_socket).expect("zc_multicast_sender");
         let packet = vec![0u8; 1232].into_boxed_slice();
-        let packet: Arc<[u8]> = Arc::from(packet);
         let bufvec = vec![packet; NUM_PACKETS];
         mc_sender
-            .batch_send_copied(&bufvec, &reader_addr_vec)
+            .batch_send_copied(bufvec, &reader_addr_vec)
             .expect("send multicast");
-
 
         for reader_sock in reader_socket_vec {
             let mut packets: Vec<Packet> = vec![Packet::default(); NUM_PACKETS];
@@ -1144,7 +1208,7 @@ mod tests {
 
     #[test]
     pub fn test_multicast_zc() {
-        init().expect("init logger");
+        // init().expect("init logger");
         log::error!("Starting multicast message test");
         let reader = bind_to_localhost().expect("bind");
         let addr = reader.local_addr().unwrap();
@@ -1159,7 +1223,7 @@ mod tests {
         let addr4 = reader4.local_addr().unwrap();
 
         let sender_socket = bind_to_localhost().expect("bind");
-        let mc_sender = zc_multicast_sender(sender_socket).expect("zc_multicast_sender");
+        let mc_sender = usk(sender_socket).expect("zc_multicast_sender");
         let mut expected_packet = vec![0u8; 1232];
 
         let mut rng = rng();
@@ -1179,10 +1243,8 @@ mod tests {
         }
     }
 
-
     #[test]
     pub fn test_batch_multicast_zc() {
-        init().expect("init logger");
         log::error!("Starting multicast message test");
         const NUM_READERS: usize = 1;
         const NUM_PACKETS: usize = 64;
@@ -1194,7 +1256,7 @@ mod tests {
             readers.push(reader);
         }
         let sender_socket = bind_to_localhost().expect("bind");
-        let mc_sender = zc_multicast_sender(sender_socket).expect("zc_multicast_sender");
+        let mc_sender = usk(sender_socket).expect("zc_multicast_sender");
         let mut expected_packet = vec![0u8; 1232];
         let mut rng = rng();
         rng.fill_bytes(expected_packet.as_mut_slice());
@@ -1213,7 +1275,6 @@ mod tests {
         }
     }
 }
-
 
 pub fn recv_mmsg_exact(socket: &UdpSocket, dest: &mut [Packet], n: usize) -> io::Result<usize> {
     let mut start = 0;

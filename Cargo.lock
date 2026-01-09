@@ -1282,6 +1282,7 @@ dependencies = [
 name = "ioring-streamer"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "core_affinity",
  "crossbeam-channel",
