@@ -349,7 +349,6 @@ pub struct GlobalSendStats {
 impl UringEvLoop {
     #[inline]
     fn push_send_req_batch(&mut self, send_req: SendReqBatch) -> usize {
-
         let mut acc = 0;
         for req in send_req.batch {
             let SendReq { dests, buf } = req;
@@ -361,7 +360,7 @@ impl UringEvLoop {
 
         acc
     }
-    
+
     #[inline]
     fn push_send_req_copied(&mut self, dests: Vec<SocketAddr>, buf: Bytes) -> usize {
         let mut total_submissions = 0;
@@ -395,7 +394,6 @@ impl UringEvLoop {
                         .inflight_send
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     total_submissions += 1;
-
                 }
                 Err(_e) => {
                     // If we can't push, we need to handle backpressure
@@ -638,7 +636,6 @@ impl UringEvLoop {
     }
 
     fn drain_process_cqe(&mut self) {
-
         let _ = self.ring.submit();
         self.ring.submission().sync();
         while self
@@ -687,7 +684,12 @@ impl UringEvLoop {
                 }
             }
         }
-        log::info!("UringEvLoop disconnected, draining remaining completions, inflights: {}", self.stats.inflight_send.load(std::sync::atomic::Ordering::Relaxed));
+        log::info!(
+            "UringEvLoop disconnected, draining remaining completions, inflights: {}",
+            self.stats
+                .inflight_send
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         self.drain_process_cqe();
     }
 }
@@ -1079,7 +1081,8 @@ pub fn zc_multicast_sender_with_config(
         core_id
     );
 
-    let ev_loop_idx = URING_EV_LOOP_THREAD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ev_loop_idx =
+        URING_EV_LOOP_THREAD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let jh = std::thread::Builder::new()
         .name(format!("uring-socket-ev-loop-{ev_loop_idx}"))
         .spawn(move || {
@@ -1089,13 +1092,16 @@ pub fn zc_multicast_sender_with_config(
             ev_loop.ev_loop();
         })?;
 
-    Ok((UringSocket {
-        free_rbuffer_rx: free_buffer_rx,
-        send_req_tx,
-        stats,
-        packet_mtu,
-        ev_loop_thread_idx: ev_loop_idx,
-    }, jh))
+    Ok((
+        UringSocket {
+            free_rbuffer_rx: free_buffer_rx,
+            send_req_tx,
+            stats,
+            packet_mtu,
+            ev_loop_thread_idx: ev_loop_idx,
+        },
+        jh,
+    ))
 }
 
 #[cfg(test)]
@@ -1165,7 +1171,10 @@ mod tests {
         let addr = reader.local_addr().unwrap();
         let sender_socket = bind_to_localhost().expect("bind");
         let (mc_sender, jh) = usk(sender_socket).expect("zc_multicast_sender");
-        log::info!("test_send_one_copied_msg: id {}", mc_sender.ev_loop_thread_idx);
+        log::info!(
+            "test_send_one_copied_msg: id {}",
+            mc_sender.ev_loop_thread_idx
+        );
         let packet = vec![0u8; 1232];
         let box_packet = packet.into_boxed_slice();
         let packet: Arc<[u8]> = Arc::from(box_packet);
@@ -1194,7 +1203,10 @@ mod tests {
         let sender_socket = bind_to_localhost().expect("bind");
 
         let (mc_sender, jh) = usk(sender_socket).expect("zc_multicast_sender");
-        log::info!("test_batch_send_copied: id {}", mc_sender.ev_loop_thread_idx);
+        log::info!(
+            "test_batch_send_copied: id {}",
+            mc_sender.ev_loop_thread_idx
+        );
         let packet = vec![0u8; 1232].into_boxed_slice();
         let bufvec = vec![packet; NUM_PACKETS];
         mc_sender
@@ -1262,7 +1274,10 @@ mod tests {
         }
         let sender_socket = bind_to_localhost().expect("bind");
         let (mc_sender, jh) = usk(sender_socket).expect("zc_multicast_sender");
-        log::info!("test_batch_multicast_zc: id {}", mc_sender.ev_loop_thread_idx);
+        log::info!(
+            "test_batch_multicast_zc: id {}",
+            mc_sender.ev_loop_thread_idx
+        );
         let mut expected_packet = vec![0u8; 1232];
         let mut rng = rng();
         rng.fill_bytes(expected_packet.as_mut_slice());

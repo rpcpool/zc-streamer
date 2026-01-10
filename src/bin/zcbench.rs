@@ -1,6 +1,6 @@
 use clap::{Arg, Command, Parser};
 use ioring_streamer::io_uring::socket::{
-    GlobalSendStats, UringSocket, ZcMulticastSenderConfig, zc_multicast_sender_with_config
+    GlobalSendStats, UringSocket, ZcMulticastSenderConfig, zc_multicast_sender_with_config,
 };
 use log::{LevelFilter, Metadata, Record, SetLoggerError};
 use rand::{RngCore, rng};
@@ -203,14 +203,13 @@ fn run_multicast_benchmark(args: MulticastArgs) {
 
     let zc_sender_config = ZcMulticastSenderConfig {
         core_id: Some(core_list[IORING_CORE_IDX]),
-        registered_buffer_size: 50_000,
+        registered_buffer_size: 100_000,
         ..Default::default()
     };
     let sender_socket =
         solana_net_utils::bind_to(args.bind.ip(), args.bind.port(), false).expect("bind");
     println!("binded to {}", sender_socket.local_addr().unwrap());
-    let zc_sender =
-        UringSocket::new(zc_sender_config, sender_socket).expect("zc_sender");
+    let zc_sender = UringSocket::new(zc_sender_config, sender_socket).expect("zc_sender");
     let stats = zc_sender.global_shared_stats();
     let sender_core_id = core_list[SENDER_CORE_IDX];
     let stop = Arc::new(AtomicBool::new(false));
